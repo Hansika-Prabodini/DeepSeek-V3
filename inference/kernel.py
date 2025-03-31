@@ -22,11 +22,11 @@ def act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     """
     pid = tl.program_id(axis=0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x = tl.load(x_ptr + offs).to(tl.float32)
+    x = tl.load(x_ptr + offs, eviction_policy="evict_last").to(tl.float32)
     s = tl.max(tl.abs(x)) / 448.
     y = x / s
     y = y.to(y_ptr.dtype.element_ty)
-    tl.store(y_ptr + offs, y)
+    tl.store(y_ptr + offs, y, eviction_policy="write_back")
     tl.store(s_ptr + pid, s)
 
 
@@ -75,10 +75,10 @@ def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
     offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     offs = offs_m[:, None] * N + offs_n[None, :]
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
+    x = tl.load(x_ptr + offs, mask=mask, eviction_policy="evict_last").to(tl.float32)
     s = tl.load(s_ptr + pid_m * n + pid_n)
     y = x * s
-    tl.store(y_ptr + offs, y, mask=mask)
+    tl.store(y_ptr + offs, y, mask=mask, eviction_policy="write_back")
 
 
 def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
@@ -150,8 +150,8 @@ def fp8_gemm_kernel(a_ptr, b_ptr, c_ptr,
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for i in range(k):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=0.0)
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K, other=0.0, eviction_policy="evict_first")
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=0.0, eviction_policy="evict_first")
         a_s = tl.load(a_s_ptrs)
         b_s = tl.load(b_s_ptrs)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
@@ -164,7 +164,7 @@ def fp8_gemm_kernel(a_ptr, b_ptr, c_ptr,
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, c, mask=mask)
+    tl.store(c_ptrs, c, mask=mask, eviction_policy="write_back")
 
 
 def fp8_gemm(a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor, b_s: torch.Tensor):

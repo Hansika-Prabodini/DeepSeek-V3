@@ -101,7 +101,10 @@ def main(fp8_path, bf16_path):
             weight_map.pop(scale_inv_name)
     with open(new_model_index_file, "w") as f:
         json.dump({"metadata": {}, "weight_map": weight_map}, f, indent=2)
-        
+
+    # Explicitly free up memory
+    del loaded_files
+    torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     parser = ArgumentParser()
@@ -109,4 +112,3 @@ if __name__ == "__main__":
     parser.add_argument("--output-bf16-hf-path", type=str, required=True)
     args = parser.parse_args()
     main(args.input_fp8_hf_path, args.output_bf16_hf_path)
-    

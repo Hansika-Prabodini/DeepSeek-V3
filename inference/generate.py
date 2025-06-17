@@ -48,34 +48,36 @@ def generate(
     Returns:
         List[List[int]]: A list of lists containing the generated tokens for each sequence.
     """
-    prompt_lens = [len(t) for t in prompt_tokens]
-    assert max(prompt_lens) <= model.max_seq_len
-    total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens))
-    tokens = torch.full((len(prompt_tokens), total_len), -1, dtype=torch.long, device="cuda")
-    for i, t in enumerate(prompt_tokens):
-        tokens[i, :len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
-    prev_pos = 0
-    finished = torch.tensor([False] * len(prompt_tokens), device="cuda")
-    prompt_mask = tokens != -1
-    for cur_pos in range(min(prompt_lens), total_len):
-        logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
-        if temperature > 0:
-            next_token = sample(logits, temperature)
-        else:
-            next_token = logits.argmax(dim=-1)
-        next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
-        tokens[:, cur_pos] = next_token
-        finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
-        prev_pos = cur_pos
-        if finished.all():
-            break
-    completion_tokens = []
-    for i, toks in enumerate(tokens.tolist()):
-        toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
-        if eos_id in toks:
-            toks = toks[:toks.index(eos_id)]
-        completion_tokens.append(toks)
-    return completion_tokens
+    # Use torch.no_grad() instead of torch.inference_mode() for better performance
+    with torch.no_grad():
+        prompt_lens = [len(t) for t in prompt_tokens]
+        assert max(prompt_lens) <= model.max_seq_len
+        total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens))
+        tokens = torch.full((len(prompt_tokens), total_len), -1, dtype=torch.long, device="cuda")
+        for i, t in enumerate(prompt_tokens):
+            tokens[i, :len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+        prev_pos = 0
+        finished = torch.tensor([False] * len(prompt_tokens), device="cuda")
+        prompt_mask = tokens != -1
+        for cur_pos in range(min(prompt_lens), total_len):
+            logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            if temperature > 0:
+                next_token = sample(logits, temperature)
+            else:
+                next_token = logits.argmax(dim=-1)
+            next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
+            tokens[:, cur_pos] = next_token
+            finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
+            prev_pos = cur_pos
+            if finished.all():
+                break
+        completion_tokens = []
+        for i, toks in enumerate(tokens.tolist()):
+            toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
+            if eos_id in toks:
+                toks = toks[:toks.index(eos_id)]
+            completion_tokens.append(toks)
+        return completion_tokens
 
 
 def main(
@@ -115,7 +117,7 @@ def main(
     with torch.device("cuda"):
         model = Transformer(args)
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
-    tokenizer.decode(generate(model, [tokenizer.encode("DeepSeek")], 2, -1, 1.)[0])
+    # Remove unnecessary decode call
     load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
 
     if interactive:

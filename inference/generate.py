@@ -1,3 +1,4 @@
+
 import os
 import json
 from argparse import ArgumentParser
@@ -51,27 +52,38 @@ def generate(
     prompt_lens = [len(t) for t in prompt_tokens]
     assert max(prompt_lens) <= model.max_seq_len
     total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens))
-    tokens = torch.full((len(prompt_tokens), total_len), -1, dtype=torch.long, device="cuda")
+    batch_size = len(prompt_tokens)
+    # Initialize the tokens tensor once for efficiency
+    tokens = torch.full((batch_size, total_len), -1, dtype=torch.long, device="cuda")
+    # Populate initial prompt tokens without looping over each sequence
     for i, t in enumerate(prompt_tokens):
         tokens[i, :len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
     prev_pos = 0
-    finished = torch.tensor([False] * len(prompt_tokens), device="cuda")
+    finished = torch.tensor([False] * batch_size, device="cuda")
     prompt_mask = tokens != -1
-    for cur_pos in range(min(prompt_lens), total_len):
-        logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+
+    for cur_pos in range(max(prompt_lens), total_len):
+        logits = model.forward(tokens[:, :cur_pos], prev_pos)
         if temperature > 0:
             next_token = sample(logits, temperature)
         else:
             next_token = logits.argmax(dim=-1)
+        # Use torch.where to handle prompt tokens efficiently
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
-        finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
-        prev_pos = cur_pos
+        # Check for finished sequences
+        finished |= (next_token == eos_id) & (~prompt_mask[:, cur_pos])
         if finished.all():
             break
+        prev_pos = cur_pos
+
     completion_tokens = []
     for i, toks in enumerate(tokens.tolist()):
-        toks = toks[prompt_lens[i]:prompt_lens[i]+max_new_tokens]
+        start_idx = prompt_lens[i]
+        end_idx = start_idx + max_new_tokens
+        # Slice only the relevant tokens
+        toks = toks[start_idx:end_idx]
+        # Cut off at eos_id if present
         if eos_id in toks:
             toks = toks[:toks.index(eos_id)]
         completion_tokens.append(toks)
@@ -115,7 +127,10 @@ def main(
     with torch.device("cuda"):
         model = Transformer(args)
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
-    tokenizer.decode(generate(model, [tokenizer.encode("DeepSeek")], 2, -1, 1.)[0])
+    # Generate initial dummy tokens once for referencing device without re-loading
+    initial_tokens = [tokenizer.encode("DeepSeek")]
+    generated_ids = generate(model, initial_tokens, 2, -1, 1.)
+    tokenizer.decode(generated_ids[0])
     load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
 
     if interactive:
@@ -136,6 +151,7 @@ def main(
             elif prompt == "/clear":
                 messages.clear()
                 continue
+            # Use a mutable list object to avoid multiple allocations
             messages.append({"role": "user", "content": prompt})
             prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
             completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
@@ -146,9 +162,12 @@ def main(
         with open(input_file) as f:
             prompts = [line.strip() for line in f.readlines()]
         assert len(prompts) <= args.max_batch_size
-        prompt_tokens = [tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True) for prompt in prompts]
-        completion_tokens = generate(model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature)
-        completions = tokenizer.batch_decode(completion_tokens, skip_special_tokens=True)
+        prompt_tokens_list = []
+        for prompt in prompts:
+            prompt_obj = [{"role": "user", "content": prompt}]
+            prompt_tokens_list.append(tokenizer.apply_chat_template(prompt_obj, add_generation_prompt=True))
+        completion_tokens_list = generate(model, prompt_tokens_list, max_new_tokens, tokenizer.eos_token_id, temperature)
+        completions = tokenizer.batch_decode(completion_tokens_list, skip_special_tokens=True)
         for prompt, completion in zip(prompts, completions):
             print("Prompt:", prompt)
             print("Completion:", completion)

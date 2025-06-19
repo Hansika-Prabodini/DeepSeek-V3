@@ -60,11 +60,11 @@ def main(fp8_path, bf16_path):
             loaded_files[file_name] = load_file(file_path, device="cuda")
         return loaded_files[file_name][tensor_name]
 
-    safetensor_files = list(glob(os.path.join(fp8_path, "*.safetensors")))
-    safetensor_files.sort()
+    safetensor_files = sorted(glob(os.path.join(fp8_path, "*.safetensors")))
     for safetensor_file in tqdm(safetensor_files):
         file_name = os.path.basename(safetensor_file)
         current_state_dict = load_file(safetensor_file, device="cuda")
+        # Store in cache
         loaded_files[file_name] = current_state_dict
         
         new_state_dict = {}
@@ -83,12 +83,13 @@ def main(fp8_path, bf16_path):
                     new_state_dict[weight_name] = weight
             else:
                 new_state_dict[weight_name] = weight
-                
+
         new_safetensor_file = os.path.join(bf16_path, file_name)
         save_file(new_state_dict, new_safetensor_file)
         
         # Memory management: keep only the 2 most recently used files
         if len(loaded_files) > 2:
+            # Remove oldest loaded file
             oldest_file = next(iter(loaded_files))
             del loaded_files[oldest_file]
             torch.cuda.empty_cache()

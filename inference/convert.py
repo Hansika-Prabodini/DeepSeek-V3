@@ -63,17 +63,24 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
                 assert key in mapping
                 new_key, dim = mapping[key]
                 name = name.replace(key, new_key)
-                for i in range(mp):
-                    new_param = param
-                    if "experts" in name and "shared_experts" not in name:
-                        idx = int(name.split(".")[-3])
-                        if idx < i * n_local_experts or idx >= (i + 1) * n_local_experts:
-                            continue
-                    elif dim is not None:
-                        assert param.size(dim) % mp == 0
-                        shard_size = param.size(dim) // mp
-                        new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
-                    state_dicts[i][name] = new_param
+                
+                # Optimize expert tensor handling
+                if "experts" in name and "shared_experts" not in name:
+                    expert_idx = int(name.split(".")[-3])
+                    target_worker = expert_idx // n_local_experts
+                    if target_worker < mp:
+                        state_dicts[target_worker][name] = param
+                else:
+                    for i in range(mp):
+                        new_param = param
+                        if dim is not None:
+                            assert param.size(dim) % mp == 0
+                            shard_size = param.size(dim) // mp
+                            new_param = param.narrow(dim, i * shard_size, shard_size)
+                            # Only call contiguous() when the tensor is not already contiguous
+                            if not new_param.is_contiguous():
+                                new_param = new_param.contiguous()
+                        state_dicts[i][name] = new_param
 
     os.makedirs(save_path, exist_ok=True)
 

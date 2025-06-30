@@ -49,31 +49,46 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
 
     for file_path in tqdm(glob(os.path.join(hf_ckpt_path, "*.safetensors"))):
         with safe_open(file_path, framework="pt", device="cpu") as f:
-            for name in f.keys():
-                if "model.layers.61" in name:
+            for orig_name in f.keys():
+                if "model.layers.61" in orig_name:
                     continue
-                param: torch.Tensor = f.get_tensor(name)
+                
+                # Process name transformations once
+                name = orig_name
                 if name.startswith("model."):
                     name = name[len("model."):]
                 name = name.replace("self_attn", "attn")
                 name = name.replace("mlp", "ffn")
                 name = name.replace("weight_scale_inv", "scale")
                 name = name.replace("e_score_correction_bias", "bias")
+                
                 key = name.split(".")[-2]
                 assert key in mapping
                 new_key, dim = mapping[key]
                 name = name.replace(key, new_key)
-                for i in range(mp):
-                    new_param = param
-                    if "experts" in name and "shared_experts" not in name:
-                        idx = int(name.split(".")[-3])
-                        if idx < i * n_local_experts or idx >= (i + 1) * n_local_experts:
-                            continue
-                    elif dim is not None:
+                
+                # Check if this is an expert parameter and determine which ranks need it
+                if "experts" in name and "shared_experts" not in name:
+                    expert_idx = int(name.split(".")[-3])
+                    target_rank = expert_idx // n_local_experts
+                    if target_rank < mp:
+                        param = f.get_tensor(orig_name)
+                        state_dicts[target_rank][name] = param
+                else:
+                    # Load parameter once
+                    param = f.get_tensor(orig_name)
+                    
+                    if dim is not None:
+                        # Parameter needs sharding
                         assert param.size(dim) % mp == 0
                         shard_size = param.size(dim) // mp
-                        new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
-                    state_dicts[i][name] = new_param
+                        for i in range(mp):
+                            new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
+                            state_dicts[i][name] = new_param
+                    else:
+                        # Parameter is shared across all ranks
+                        for i in range(mp):
+                            state_dicts[i][name] = param
 
     os.makedirs(save_path, exist_ok=True)
 

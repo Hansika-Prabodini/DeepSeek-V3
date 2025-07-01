@@ -45,41 +45,74 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
     """
     torch.set_num_threads(8)
     n_local_experts = n_experts // mp
-    state_dicts = [{} for _ in range(mp)]
-
-    for file_path in tqdm(glob(os.path.join(hf_ckpt_path, "*.safetensors"))):
+    
+    # Pre-compute expert ranges for each model parallel rank
+    expert_ranges = [(i * n_local_experts, (i + 1) * n_local_experts) for i in range(mp)]
+    
+    # Create save directory early
+    os.makedirs(save_path, exist_ok=True)
+    
+    # Process each file separately to reduce peak memory usage
+    safetensor_files = glob(os.path.join(hf_ckpt_path, "*.safetensors"))
+    
+    for file_path in tqdm(safetensor_files):
+        state_dicts = [{} for _ in range(mp)]
+        
         with safe_open(file_path, framework="pt", device="cpu") as f:
             for name in f.keys():
                 if "model.layers.61" in name:
                     continue
-                param: torch.Tensor = f.get_tensor(name)
+                    
+                param = f.get_tensor(name)
+                
+                # Apply name transformations
                 if name.startswith("model."):
-                    name = name[len("model."):]
-                name = name.replace("self_attn", "attn")
-                name = name.replace("mlp", "ffn")
-                name = name.replace("weight_scale_inv", "scale")
-                name = name.replace("e_score_correction_bias", "bias")
+                    name = name[6:]  # More efficient than name[len("model."):]
+                
+                # Chain replace operations to avoid multiple string operations
+                name = (name.replace("self_attn", "attn")
+                           .replace("mlp", "ffn")
+                           .replace("weight_scale_inv", "scale")
+                           .replace("e_score_correction_bias", "bias"))
+                
                 key = name.split(".")[-2]
                 assert key in mapping
                 new_key, dim = mapping[key]
                 name = name.replace(key, new_key)
+                
+                # Check if this is an expert parameter
+                is_expert = "experts" in name and "shared_experts" not in name
+                expert_idx = None
+                if is_expert:
+                    expert_idx = int(name.split(".")[-3])
+                
                 for i in range(mp):
-                    new_param = param
-                    if "experts" in name and "shared_experts" not in name:
-                        idx = int(name.split(".")[-3])
-                        if idx < i * n_local_experts or idx >= (i + 1) * n_local_experts:
+                    # Skip expert if it doesn't belong to this rank
+                    if is_expert:
+                        start_idx, end_idx = expert_ranges[i]
+                        if expert_idx < start_idx or expert_idx >= end_idx:
                             continue
+                        state_dicts[i][name] = param
                     elif dim is not None:
+                        # Shard parameter along specified dimension
                         assert param.size(dim) % mp == 0
                         shard_size = param.size(dim) // mp
                         new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
-                    state_dicts[i][name] = new_param
+                        state_dicts[i][name] = new_param
+                    else:
+                        # Parameter is replicated across all ranks
+                        state_dicts[i][name] = param
+        
+        # Save state dicts for this file and clear memory
+        for i in range(mp):
+            if state_dicts[i]:  # Only save if there are parameters
+                output_file = os.path.join(save_path, f"model{i}-mp{mp}-{os.path.basename(file_path)}")
+                save_file(state_dicts[i], output_file)
+        
+        # Clear memory after processing each file
+        del state_dicts
 
-    os.makedirs(save_path, exist_ok=True)
-
-    for i in trange(mp):
-        save_file(state_dicts[i], os.path.join(save_path, f"model{i}-mp{mp}.safetensors"))
-
+    # Copy tokenizer files
     for file_path in glob(os.path.join(hf_ckpt_path, "*token*")):
         new_file_path = os.path.join(save_path, os.path.basename(file_path))
         shutil.copyfile(file_path, new_file_path)

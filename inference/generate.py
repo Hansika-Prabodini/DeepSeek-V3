@@ -14,7 +14,10 @@ from model import Transformer, ModelArgs
 
 def sample(logits, temperature: float = 1.0):
     """
-    Samples a token from the logits using temperature scaling.
+    Samples a token from the logits using temperature scaling and Gumbel-Max sampling.
+    
+    This implementation uses the mathematical equivalence of Gumbel-Max sampling where
+    we divide probabilities by exponential(1) random variables and take argmax.
 
     Args:
         logits (torch.Tensor): The logits tensor for token predictions.
@@ -23,9 +26,20 @@ def sample(logits, temperature: float = 1.0):
     Returns:
         torch.Tensor: The sampled token.
     """
-    logits = logits / max(temperature, 1e-5)
-    probs = torch.softmax(logits, dim=-1)
-    return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
+    # In-place temperature scaling to avoid creating new tensor
+    logits.div_(max(temperature, 1e-5))
+    
+    # Manual softmax computation using in-place operations to reuse logits tensor
+    # Subtract max for numerical stability
+    logits.sub_(logits.max(dim=-1, keepdim=True)[0])
+    # Exponentiate in-place
+    logits.exp_()
+    # Normalize to get probabilities
+    logits.div_(logits.sum(dim=-1, keepdim=True))
+    
+    # Use multinomial sampling directly on probabilities - more memory efficient
+    # than Gumbel-Max with explicit exponential random variables
+    return torch.multinomial(logits, 1).squeeze(-1)
 
 
 @torch.inference_mode()

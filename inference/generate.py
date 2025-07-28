@@ -90,6 +90,34 @@ def generate(
     return completion_tokens
 
 
+import os
+import json
+import torch
+import torch.distributed as dist
+from transformers import AutoTokenizer
+
+# Note: The following imports are assumed to be available from the project structure.
+# from model import Transformer, ModelArgs
+# from generation import generate
+# from modeling.load import load_model
+
+# --- Helper function defined before it is called ---
+def _process_batch_chunk(prompts, tokenizer, model, max_new_tokens, temperature):
+    """Processes a chunk of prompts for batch generation."""
+    prompt_tokens_list = []
+    for prompt in prompts:
+        prompt_obj = [{"role": "user", "content": prompt}]
+        prompt_tokens_list.append(tokenizer.apply_chat_template(prompt_obj, add_generation_prompt=True))
+    
+    completion_tokens_list = generate(model, prompt_tokens_list, max_new_tokens, tokenizer.eos_token_id, temperature)
+    completions = tokenizer.batch_decode(completion_tokens_list, skip_special_tokens=True)
+
+    # Print results for the processed chunk
+    for prompt, completion in zip(prompts, completions):
+        print("Prompt:", prompt)
+        print("Completion:", completion)
+        print()
+
 def main(
     ckpt_path: str,
     config: str,
@@ -114,67 +142,92 @@ def main(
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
     if world_size > 1:
         dist.init_process_group("nccl")
-    global print
+    
+    # Redirect print to be a no-op on non-main processes
     if rank != 0:
+        global print
         print = lambda *_, **__: None
+
     torch.cuda.set_device(local_rank)
     torch.set_default_dtype(torch.bfloat16)
     torch.set_num_threads(8)
     torch.manual_seed(965)
+    
     with open(config) as f:
         args = ModelArgs(**json.load(f))
     print(args)
+    
     with torch.device("cuda"):
         model = Transformer(args)
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
-    # Generate initial dummy tokens once for referencing device without re-loading
+    
+    # Generate initial dummy tokens to initialize model device
     initial_tokens = [tokenizer.encode("DeepSeek")]
     generated_ids = generate(model, initial_tokens, 2, -1, 1.)
     tokenizer.decode(generated_ids[0])
+    
     load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
 
     if interactive:
+        # Limit history to the last 10 exchanges (20 messages)
+        MAX_HISTORY_SIZE = 20
         messages = []
+        
         while True:
-            if world_size == 1:
+            if world_size > 1 and rank == 0:
                 prompt = input(">>> ")
-            elif rank == 0:
-                prompt = input(">>> ")
-                objects = [prompt]
-                dist.broadcast_object_list(objects, 0)
-            else:
+                dist.broadcast_object_list([prompt], 0)
+            elif world_size > 1:
                 objects = [None]
                 dist.broadcast_object_list(objects, 0)
                 prompt = objects[0]
+            else: # world_size == 1
+                prompt = input(">>> ")
+                
             if prompt == "/exit":
                 break
-            elif prompt == "/clear":
+            if prompt == "/clear":
                 messages.clear()
+                print("History cleared.")
                 continue
-            # Use a mutable list object to avoid multiple allocations
+            
             messages.append({"role": "user", "content": prompt})
+            
             prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
             completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
             completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
             print(completion)
+            
             messages.append({"role": "assistant", "content": completion})
+
+            # Trim history to maintain the desired size (removes oldest user/assistant pair)
+            while len(messages) > MAX_HISTORY_SIZE:
+                del messages[:2]
     else:
-        with open(input_file) as f:
-            prompts = [line.strip() for line in f.readlines()]
-        assert len(prompts) <= args.max_batch_size
-        prompt_tokens_list = []
-        for prompt in prompts:
-            prompt_obj = [{"role": "user", "content": prompt}]
-            prompt_tokens_list.append(tokenizer.apply_chat_template(prompt_obj, add_generation_prompt=True))
-        completion_tokens_list = generate(model, prompt_tokens_list, max_new_tokens, tokenizer.eos_token_id, temperature)
-        completions = tokenizer.batch_decode(completion_tokens_list, skip_special_tokens=True)
-        for prompt, completion in zip(prompts, completions):
-            print("Prompt:", prompt)
-            print("Completion:", completion)
-            print()
+        # Process prompts from a file in memory-efficient chunks
+        BATCH_CHUNK_SIZE = min(8, args.max_batch_size)
+        
+        try:
+            with open(input_file) as f:
+                prompt_batch = []
+                for line in f:
+                    prompt = line.strip()
+                    if prompt:
+                        prompt_batch.append(prompt)
+                    
+                    if len(prompt_batch) >= BATCH_CHUNK_SIZE:
+                        _process_batch_chunk(prompt_batch, tokenizer, model, max_new_tokens, temperature)
+                        prompt_batch.clear()
+                
+                # Process any remaining prompts in the last batch
+                if prompt_batch:
+                    _process_batch_chunk(prompt_batch, tokenizer, model, max_new_tokens, temperature)
+        except FileNotFoundError:
+            print(f"Error: Input file not found at {input_file}")
 
     if world_size > 1:
         dist.destroy_process_group()
+
 
 
 if __name__ == "__main__":

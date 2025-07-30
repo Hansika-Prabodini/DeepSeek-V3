@@ -43,7 +43,7 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
     Returns:
         None
     """
-    torch.set_num_threads(8)
+    torch.set_num_threads(os.cpu_count() or 1)
     n_local_experts = n_experts // mp
     
     # Pre-compute expert ranges for each model parallel rank
@@ -67,7 +67,7 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
                 
                 # Apply name transformations
                 if name.startswith("model."):
-                    name = name[6:]  # More efficient than name[len("model."):]
+                    name = name[6:]  # Direct slicing is efficient
                 
                 # Chain replace operations to avoid multiple string operations
                 name = (name.replace("self_attn", "attn")
@@ -97,7 +97,7 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
                         # Shard parameter along specified dimension
                         assert param.size(dim) % mp == 0
                         shard_size = param.size(dim) // mp
-                        new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
+                        new_param = param.narrow(dim, i * shard_size, shard_size)
                         state_dicts[i][name] = new_param
                     else:
                         # Parameter is replicated across all ranks

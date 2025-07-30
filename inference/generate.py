@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
 from safetensors.torch import load_model
+from torch.nn.utils.rnn import pad_sequence # Added for efficient batch padding
 
 from model import Transformer, ModelArgs
 
@@ -53,11 +54,17 @@ def generate(
     assert max(prompt_lens) <= model.max_seq_len
     total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens))
     batch_size = len(prompt_tokens)
-    # Initialize the tokens tensor once for efficiency
+    # Convert prompt_tokens to tensors and pad them for efficient batch processing
+    prompt_tensors = [torch.tensor(p, dtype=torch.long, device="cuda") for p in prompt_tokens]
+    # Pad them to the maximum prompt length in the batch using -1 as padding value
+    # `pad_sequence` handles varying lengths and ensures batch_first output
+    padded_prompt_tensor = pad_sequence(prompt_tensors, batch_first=True, padding_value=-1)
+
+    # Initialize the main tokens tensor with the padded prompts
+    # Ensure total_len is at least the padded prompt length
     tokens = torch.full((batch_size, total_len), -1, dtype=torch.long, device="cuda")
-    # Populate initial prompt tokens without looping over each sequence
-    for i, t in enumerate(prompt_tokens):
-        tokens[i, :len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+    tokens[:, :padded_prompt_tensor.shape[1]] = padded_prompt_tensor
+
     prev_pos = 0
     finished = torch.tensor([False] * batch_size, device="cuda")
     prompt_mask = tokens != -1
@@ -78,14 +85,21 @@ def generate(
         prev_pos = cur_pos
 
     completion_tokens = []
-    for i, toks in enumerate(tokens.tolist()):
+    for i in range(batch_size):
         start_idx = prompt_lens[i]
         end_idx = start_idx + max_new_tokens
-        # Slice only the relevant tokens
-        toks = toks[start_idx:end_idx]
-        # Cut off at eos_id if present
-        if eos_id in toks:
-            toks = toks[:toks.index(eos_id)]
+        # Get the slice directly from the tensor on GPU
+        sequence_slice = tokens[i, start_idx:end_idx]
+
+        # Find the first occurrence of eos_id on the tensor slice
+        eos_pos_in_slice = (sequence_slice == eos_id).nonzero(as_tuple=True)[0]
+        if eos_pos_in_slice.numel() > 0:
+            # If eos_id is found, slice up to it and then convert to list
+            cut_off_idx = eos_pos_in_slice[0].item()
+            toks = sequence_slice[:cut_off_idx].tolist()
+        else:
+            # Otherwise, convert the entire slice to list
+            toks = sequence_slice.tolist()
         completion_tokens.append(toks)
     return completion_tokens
 

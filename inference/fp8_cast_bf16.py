@@ -3,7 +3,7 @@ import json
 from argparse import ArgumentParser
 from glob import glob
 from tqdm import tqdm
-from collections import OrderedDict
+from collections import defaultdict
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -41,14 +41,14 @@ def main(fp8_path, bf16_path):
     scale_inv_map = {k: v for k, v in weight_map.items() if k.endswith("_scale_inv")}
     
     # LRU cache for loaded safetensor files with size-based eviction
-    loaded_files = OrderedDict()
+    loaded_files = {}
     max_cache_size_gb = 4  # Maximum cache size in GB
-    current_cache_size = 0
+    current_cache_size = 0.0
     fp8_weight_names = []
 
     def get_file_size_gb(tensor_dict):
         """Calculate approximate memory size of tensor dict in GB"""
-        total_bytes = sum(t.numel() * t.element_size() for t in tensor_dict.values())
+        total_bytes = sum(t.numel() * t.element_size() for t in tensor_dict.values()) if tensor_dict else 0
         return total_bytes / (1024**3)
 
     def get_tensor(tensor_name, device="cpu"):
@@ -72,8 +72,7 @@ def main(fp8_path, bf16_path):
         
         # Move to end (most recently used) if already in cache
         if file_name in loaded_files:
-            loaded_files.move_to_end(file_name)
-            return loaded_files[file_name][tensor_name].to(device)
+            return loaded_files[file_name][tensor_name].to(device)  # Return cached tensor directly
         
         # Load new file
         file_path = os.path.join(fp8_path, file_name)
@@ -82,12 +81,13 @@ def main(fp8_path, bf16_path):
         
         # Evict old files if cache would exceed size limit
         while current_cache_size + new_size > max_cache_size_gb and loaded_files:
-            oldest_file, oldest_tensors = loaded_files.popitem(last=False)
+            oldest_file = next(iter(loaded_files))
+            oldest_tensors = loaded_files.pop(oldest_file)
             current_cache_size -= get_file_size_gb(oldest_tensors)
             del oldest_tensors
         
         # Add new file to cache
-        loaded_files[file_name] = new_tensors
+        loaded_files[file_name] = new_tensors  # Cache the loaded tensors
         current_cache_size += new_size
         
         return new_tensors[tensor_name].to(device)
@@ -107,7 +107,7 @@ def main(fp8_path, bf16_path):
         weight_names_batch = []
         new_state_dict = {}
         
-        for weight_name, weight in current_state_dict.items():
+        for weight_name, weight in current_state_dict.items():  # Iterate through weights
             if weight_name.endswith("_scale_inv"):
                 continue
             elif weight.element_size() == 1:  # FP8 weight
@@ -131,7 +131,7 @@ def main(fp8_path, bf16_path):
         
         # Process FP8 weights in batch for better GPU utilization
         for i, (fp8_weight, scale_inv, weight_name) in enumerate(zip(fp8_weights_batch, scale_inv_batch, weight_names_batch)):
-            new_state_dict[weight_name] = weight_dequant(fp8_weight, scale_inv)
+            new_state_dict[weight_name] = weight_dequant(fp8_weight, scale_inv)  # Dequantize and store
             # Free GPU memory immediately after processing each tensor
             del fp8_weight, scale_inv
             if i % 10 == 9:  # Periodic cleanup every 10 tensors

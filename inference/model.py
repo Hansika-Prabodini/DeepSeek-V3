@@ -100,7 +100,7 @@ class ParallelEmbedding(nn.Module):
         self.part_vocab_size = (vocab_size // world_size)
         self.vocab_start_idx = rank * self.part_vocab_size
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
-        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
+        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, dtype=torch.float16))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -177,7 +177,7 @@ class Linear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype))
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype or Linear.dtype).to(dtype=torch.float16))
         if self.weight.element_size() == 1:
             scale_out_features = (out_features + block_size - 1) // block_size
             scale_in_features = (in_features + block_size - 1) // block_size
@@ -424,10 +424,10 @@ class MLA(nn.Module):
             self.wq_a = Linear(self.dim, self.q_lora_rank)
             self.q_norm = RMSNorm(self.q_lora_rank)
             self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
-        self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
+        self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim, dtype=torch.float16)
         self.kv_norm = RMSNorm(self.kv_lora_rank)
-        self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
-        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
+        self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim), dtype=torch.float16)
+        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim, dtype=torch.float16)
         self.softmax_scale = self.qk_head_dim ** -0.5
         if args.max_seq_len > args.original_seq_len:
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
@@ -512,9 +512,9 @@ class MLP(nn.Module):
             inter_dim (int): Hidden layer dimensionality.
         """
         super().__init__()
-        self.w1 = ColumnParallelLinear(dim, inter_dim)
-        self.w2 = RowParallelLinear(inter_dim, dim)
-        self.w3 = ColumnParallelLinear(dim, inter_dim)
+        self.w1 = ColumnParallelLinear(dim, inter_dim, dtype=torch.float16)
+        self.w2 = RowParallelLinear(inter_dim, dim, dtype=torch.float16)
+        self.w3 = ColumnParallelLinear(dim, inter_dim, dtype=torch.float16)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -557,8 +557,8 @@ class Gate(nn.Module):
         self.topk_groups = args.n_limited_groups
         self.score_func = args.score_func
         self.route_scale = args.route_scale
-        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
-        self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
+        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim, dtype=torch.float16))
+        self.bias = nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float16)) if self.dim == 7168 else None
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -613,9 +613,9 @@ class Expert(nn.Module):
             inter_dim (int): Hidden layer dimensionality.
         """
         super().__init__()
-        self.w1 = Linear(dim, inter_dim)
-        self.w2 = Linear(inter_dim, dim)
-        self.w3 = Linear(dim, inter_dim)
+        self.w1 = Linear(dim, inter_dim, dtype=torch.float16)
+        self.w2 = Linear(inter_dim, dim, dtype=torch.float16)
+        self.w3 = Linear(dim, inter_dim, dtype=torch.float16)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -762,7 +762,7 @@ class Transformer(nn.Module):
         for layer_id in range(args.n_layers):
             self.layers.append(Block(layer_id, args))
         self.norm = RMSNorm(args.dim)
-        self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
+        self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.float16)
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
 
     @torch.inference_mode()
@@ -786,7 +786,7 @@ class Transformer(nn.Module):
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)[:, -1]
-        logits = self.head(h)
+        logits = self.head(h.to(torch.float16))
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)

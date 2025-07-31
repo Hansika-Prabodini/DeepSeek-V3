@@ -384,9 +384,27 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         torch.Tensor: Tensor with rotary embeddings applied.
     """
     dtype = x.dtype
-    x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
-    y = torch.view_as_real(x * freqs_cis).flatten(3)
+    # x: (..., D) where D is qk_rope_head_dim
+    # freqs_cis: (seq_len, D/2) complex
+
+    # Reshape x to (..., D/2, 2)
+    x_reshaped = x.view(*x.shape[:-1], -1, 2)
+    x_real, x_imag = x_reshaped.unbind(-1) # (..., D/2)
+
+    # freqs_cis is (current_seqlen, D/2) complex.
+    # Reshape freqs_cis to broadcast with x_real/x_imag
+    current_seqlen = freqs_cis.shape[0]
+    head_dim_half = freqs_cis.shape[1]
+
+    freqs_cis_real = freqs_cis.real.view(1, current_seqlen, 1, head_dim_half)
+    freqs_cis_imag = freqs_cis.imag.view(1, current_seqlen, 1, head_dim_half)
+
+    # Perform complex multiplication manually
+    x_out_real = x_real * freqs_cis_real - x_imag * freqs_cis_imag
+    x_out_imag = x_real * freqs_cis_imag + x_imag * freqs_cis_real
+
+    # Reconstruct the tensor
+    y = torch.stack([x_out_real, x_out_imag], dim=-1).flatten(-2)
     return y.to(dtype)
 
 
@@ -471,25 +489,69 @@ class MLA(nn.Module):
             kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+            # Prepare for SDPA: (batch_size, num_heads, query_seq_len, head_dim)
+            query = q.transpose(1, 2)
+            
+            # Key/Value preparation
+            kv_proj = self.wkv_b(self.kv_norm(kv)) # Output of ColumnParallelLinear
+            kv_proj = kv_proj.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            k_nope, v = torch.split(kv_proj, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1) # (bsz, seqlen, n_local_heads, qk_head_dim)
+            
+            # Update cache
             self.k_cache[:bsz, start_pos:end_pos] = k
             self.v_cache[:bsz, start_pos:end_pos] = v
-            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
-        else:
-            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
-            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
-            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
+
+            # Retrieve from cache and transpose for SDPA
+            key = self.k_cache[:bsz, :end_pos].transpose(1, 2) # (bsz, n_local_heads, end_pos, qk_head_dim)
+            value = self.v_cache[:bsz, :end_pos].transpose(1, 2) # (bsz, n_local_heads, end_pos, v_head_dim)
+
+            # Use scaled_dot_product_attention for optimized computation
+            attn_output = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=mask, # Pass the additive mask directly
+                dropout_p=0.0,
+                is_causal=False, # Mask handles causality
+            )
+
+            # SDPA automatically scales by `query.size(-1)**-0.5`.
+            # If self.softmax_scale contains an additional `mscale` factor, apply it.
+            mscale_factor = self.softmax_scale * (self.qk_head_dim ** 0.5)
+            if abs(mscale_factor - 1.0) > 1e-6:
+                attn_output = attn_output * mscale_factor
+
+            x = attn_output.transpose(1, 2).contiguous().flatten(2)
+        else: # attn_impl == "absorb"
+            # Cache dequantized weight for bf16 gemm if wkv_b is fp8
+            if gemm_impl == "bf16" and self.wkv_b.scale is not None:
+                if not hasattr(self, '_wkv_b_dequantized_weight_cached') or self._wkv_b_dequantized_weight_cached is None:
+                    self._wkv_b_dequantized_weight_cached = weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size)
+                wkv_b_actual = self._wkv_b_dequantized_weight_cached
+            else:
+                # Use raw weight for fp8 or if it's already bf16
+                wkv_b_actual = self.wkv_b.weight
+
+            wkv_b_view = wkv_b_actual.view(self.n_local_heads, -1, self.kv_lora_rank)
+            
+            # Custom attention calculations for "absorb"
+            q_nope_projected = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b_view[:, :self.qk_nope_head_dim])
+            
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
             self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
-            scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
+            
+            scores = (torch.einsum("bshc,btc->bsht", q_nope_projected, self.kv_cache[:bsz, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
-        if mask is not None:
-            scores += mask.unsqueeze(1)
-        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
-        if attn_impl == "naive":
-            x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
-        else:
+            
+            if mask is not None:
+                scores += mask.unsqueeze(1)
+            
+            scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+            
             x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
-            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
+            x = torch.einsum("bshc,hdc->bshd", x, wkv_b_view[:, -self.v_head_dim:])
+        
         x = self.wo(x.flatten(2))
         return x
 

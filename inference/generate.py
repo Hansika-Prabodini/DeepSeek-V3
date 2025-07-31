@@ -55,18 +55,18 @@ def generate(
     total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens))
     batch_size = len(prompt_tokens)
     # Convert prompt_tokens to tensors and pad them for efficient batch processing
-    prompt_tensors = [torch.tensor(p, dtype=torch.long, device="cuda", requires_grad=False) for p in prompt_tokens]
+    prompt_tensors = [torch.tensor(p, dtype=torch.long, device="cuda") for p in prompt_tokens]
     # Pad them to the maximum prompt length in the batch using -1 as padding value
     # `pad_sequence` handles varying lengths and ensures batch_first output
     padded_prompt_tensor = pad_sequence(prompt_tensors, batch_first=True, padding_value=-1)
 
     # Initialize the main tokens tensor with the padded prompts
     # Ensure total_len is at least the padded prompt length
-    tokens = torch.full((batch_size, total_len), -1, dtype=torch.long, device="cuda", requires_grad=False)
+    tokens = torch.full((batch_size, total_len), -1, dtype=torch.long, device="cuda")
     tokens[:, :padded_prompt_tensor.shape[1]] = padded_prompt_tensor
 
     prev_pos = 0
-    finished = torch.zeros(batch_size, dtype=torch.bool, device="cuda")
+    finished = torch.zeros(batch_size, dtype=torch.bool, device="cuda", requires_grad=False)
     prompt_mask = tokens != -1
 
     for cur_pos in range(max(prompt_lens), total_len):
@@ -152,7 +152,7 @@ def main(
 
     torch.cuda.set_device(local_rank)
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_num_threads(8)
+    torch.set_num_threads(os.cpu_count())
     torch.manual_seed(965)
     
     with open(config) as f:
@@ -165,7 +165,7 @@ def main(
     
     # Generate initial dummy tokens to initialize model device
     initial_tokens = [tokenizer.encode("DeepSeek")]
-    generated_ids = generate(model, initial_tokens, 2, -1, 1.)
+    generated_ids = generate(model, initial_tokens, 2, tokenizer.eos_token_id, 1.)
     tokenizer.decode(generated_ids[0])
     
     load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
@@ -195,7 +195,7 @@ def main(
             
             messages.append({"role": "user", "content": prompt})
             
-            prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+            prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=False)
             completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
             completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
             print(completion)

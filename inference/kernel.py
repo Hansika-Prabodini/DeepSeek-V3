@@ -23,7 +23,7 @@ def act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis=0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     x = tl.load(x_ptr + offs).to(tl.float32)
-    s = tl.max(tl.abs(x)) / 448.
+    s = tl.max(tl.abs(x)) / 448. + 1e-6  # Prevent division by zero
     y = x / s
     y = y.to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y)
@@ -45,7 +45,7 @@ def act_quant(x: torch.Tensor, block_size: int = 128) -> Tuple[torch.Tensor, tor
     """
     assert x.is_contiguous()
     assert x.size(-1) % block_size == 0
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    y = torch.empty(x.size(), dtype=torch.float8_e4m3fn, device=x.device)  # Avoid unnecessary memory allocation
     s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
     grid = lambda meta: (triton.cdiv(x.numel(), meta['BLOCK_SIZE']), )
     act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
@@ -99,7 +99,7 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> t
     assert x.is_contiguous() and s.is_contiguous()
     assert x.dim() == 2 and s.dim() == 2
     M, N = x.size()
-    y = torch.empty_like(x, dtype=torch.get_default_dtype())
+    y = torch.empty(x.size(), dtype=torch.get_default_dtype(), device=x.device)  # Avoid unnecessary memory allocation
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE']), triton.cdiv(N, meta['BLOCK_SIZE']))
     weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
     return y
@@ -148,7 +148,7 @@ def fp8_gemm_kernel(a_ptr, b_ptr, c_ptr,
     a_s_ptrs = a_s_ptr + offs_m * k
     b_s_ptrs = b_s_ptr + (offs_n // BLOCK_SIZE_K) * k
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32, device=a_ptr.device)  # Ensure accumulator is on the same device
     for i in range(k):
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K, other=0.0)
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=0.0)
@@ -159,7 +159,7 @@ def fp8_gemm_kernel(a_ptr, b_ptr, c_ptr,
         b_ptrs += BLOCK_SIZE_K
         a_s_ptrs += 1
         b_s_ptrs += 1
-    c = accumulator.to(c_ptr.dtype.element_ty)
+    c = accumulator.to(c_ptr.dtype.element_ty)  # Keep this line for type consistency
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]

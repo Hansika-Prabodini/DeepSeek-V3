@@ -3,6 +3,7 @@ import json
 from argparse import ArgumentParser
 from glob import glob
 from tqdm import tqdm
+from collections import OrderedDict
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -36,17 +37,28 @@ def main(fp8_path, bf16_path):
         model_index = json.load(f)
     weight_map = model_index["weight_map"]
     
-    # Cache for loaded safetensor files
-    loaded_files = {}
+    # Pre-compute scale_inv mappings for faster lookup
+    scale_inv_map = {k: v for k, v in weight_map.items() if k.endswith("_scale_inv")}
+    
+    # LRU cache for loaded safetensor files with size-based eviction
+    loaded_files = OrderedDict()
+    max_cache_size_gb = 4  # Maximum cache size in GB
+    current_cache_size = 0
     fp8_weight_names = []
 
-    # Helper function to get tensor from the correct file
-    def get_tensor(tensor_name):
+    def get_file_size_gb(tensor_dict):
+        """Calculate approximate memory size of tensor dict in GB"""
+        total_bytes = sum(t.numel() * t.element_size() for t in tensor_dict.values())
+        return total_bytes / (1024**3)
+
+    def get_tensor(tensor_name, device="cpu"):
         """
         Retrieves a tensor from the cached safetensor files or loads it from disk if not cached.
+        Uses LRU caching with size-based eviction.
 
         Args:
             tensor_name (str): The name of the tensor to retrieve.
+            device (str): Device to load tensor to. Default is "cpu".
 
         Returns:
             torch.Tensor: The retrieved tensor.
@@ -54,44 +66,86 @@ def main(fp8_path, bf16_path):
         Raises:
             KeyError: If the tensor does not exist in the safetensor file.
         """
+        nonlocal current_cache_size
+        
         file_name = weight_map[tensor_name]
-        if file_name not in loaded_files:
-            file_path = os.path.join(fp8_path, file_name)
-            loaded_files[file_name] = load_file(file_path, device="cuda")
-        return loaded_files[file_name][tensor_name]
+        
+        # Move to end (most recently used) if already in cache
+        if file_name in loaded_files:
+            loaded_files.move_to_end(file_name)
+            return loaded_files[file_name][tensor_name].to(device)
+        
+        # Load new file
+        file_path = os.path.join(fp8_path, file_name)
+        new_tensors = load_file(file_path, device="cpu")  # Load to CPU first
+        new_size = get_file_size_gb(new_tensors)
+        
+        # Evict old files if cache would exceed size limit
+        while current_cache_size + new_size > max_cache_size_gb and loaded_files:
+            oldest_file, oldest_tensors = loaded_files.popitem(last=False)
+            current_cache_size -= get_file_size_gb(oldest_tensors)
+            del oldest_tensors
+        
+        # Add new file to cache
+        loaded_files[file_name] = new_tensors
+        current_cache_size += new_size
+        
+        return new_tensors[tensor_name].to(device)
 
     safetensor_files = list(glob(os.path.join(fp8_path, "*.safetensors")))
     safetensor_files.sort()
+    
     for safetensor_file in tqdm(safetensor_files):
         file_name = os.path.basename(safetensor_file)
-        current_state_dict = load_file(safetensor_file, device="cuda")
-        loaded_files[file_name] = current_state_dict
         
+        # Load current file to CPU first for efficient processing
+        current_state_dict = load_file(safetensor_file, device="cpu")
+        
+        # Batch process tensors to improve GPU utilization
+        fp8_weights_batch = []
+        scale_inv_batch = []
+        weight_names_batch = []
         new_state_dict = {}
+        
         for weight_name, weight in current_state_dict.items():
             if weight_name.endswith("_scale_inv"):
                 continue
             elif weight.element_size() == 1:  # FP8 weight
                 scale_inv_name = f"{weight_name}_scale_inv"
                 try:
-                    # Get scale_inv from the correct file
-                    scale_inv = get_tensor(scale_inv_name)
-                    fp8_weight_names.append(weight_name)
-                    new_state_dict[weight_name] = weight_dequant(weight, scale_inv)
+                    # Check if scale_inv exists in weight_map
+                    if scale_inv_name in scale_inv_map:
+                        scale_inv = get_tensor(scale_inv_name, device="cpu")
+                        fp8_weights_batch.append(weight.cuda())
+                        scale_inv_batch.append(scale_inv.cuda())
+                        weight_names_batch.append(weight_name)
+                        fp8_weight_names.append(weight_name)
+                    else:
+                        print(f"Warning: Missing scale_inv tensor for {weight_name}, skipping conversion")
+                        new_state_dict[weight_name] = weight
                 except KeyError:
                     print(f"Warning: Missing scale_inv tensor for {weight_name}, skipping conversion")
                     new_state_dict[weight_name] = weight
             else:
                 new_state_dict[weight_name] = weight
-                
+        
+        # Process FP8 weights in batch for better GPU utilization
+        for i, (fp8_weight, scale_inv, weight_name) in enumerate(zip(fp8_weights_batch, scale_inv_batch, weight_names_batch)):
+            new_state_dict[weight_name] = weight_dequant(fp8_weight, scale_inv)
+            # Free GPU memory immediately after processing each tensor
+            del fp8_weight, scale_inv
+            if i % 10 == 9:  # Periodic cleanup every 10 tensors
+                torch.cuda.empty_cache()
+        
+        # Clear batch arrays to free memory
+        del fp8_weights_batch, scale_inv_batch, weight_names_batch
+        
         new_safetensor_file = os.path.join(bf16_path, file_name)
         save_file(new_state_dict, new_safetensor_file)
         
-        # Memory management: keep only the 2 most recently used files
-        if len(loaded_files) > 2:
-            oldest_file = next(iter(loaded_files))
-            del loaded_files[oldest_file]
-            torch.cuda.empty_cache()
+        # Explicit cleanup after processing each file
+        del current_state_dict, new_state_dict
+        torch.cuda.empty_cache()
     
     # Update model index
     new_model_index_file = os.path.join(bf16_path, "model.safetensors.index.json")

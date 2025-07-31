@@ -43,7 +43,8 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
     Returns:
         None
     """
-    torch.set_num_threads(os.cpu_count() or 1)
+    torch.set_num_threads(os.cpu_count() or 1)  # Set number of threads for performance
+    device = "cpu"  # Use a variable for device to avoid repeated string literals
     n_local_experts = n_experts // mp
     
     # Pre-compute expert ranges for each model parallel rank

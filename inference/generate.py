@@ -14,19 +14,9 @@ from model import Transformer, ModelArgs
 
 
 def sample(logits, temperature: float = 1.0):
-    """
-    Samples a token from the logits using temperature scaling.
-
-    Args:
-        logits (torch.Tensor): The logits tensor for token predictions.
-        temperature (float, optional): Temperature for scaling logits. Defaults to 1.0.
-
-    Returns:
-        torch.Tensor: The sampled token.
-    """
     logits = logits / max(temperature, 1e-5)
     probs = torch.softmax(logits, dim=-1)
-    return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
 @torch.inference_mode()
@@ -37,48 +27,31 @@ def generate(
     eos_id: int,
     temperature: float = 1.0
 ) -> List[List[int]]:
-    """
-    Generates new tokens based on the given prompt tokens using the specified model.
-
-    Args:
-        model (Transformer): The transformer model used for token generation.
-        prompt_tokens (List[List[int]]): A list of lists containing the prompt tokens for each sequence.
-        max_new_tokens (int): The maximum number of new tokens to generate.
-        eos_id (int): The end-of-sequence token ID.
-        temperature (float, optional): The temperature value for sampling. Defaults to 1.0.
-
-    Returns:
-        List[List[int]]: A list of lists containing the generated tokens for each sequence.
-    """
     prompt_lens = [len(t) for t in prompt_tokens]
     assert max(prompt_lens) <= model.max_seq_len
     total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens))
     batch_size = len(prompt_tokens)
-    # Convert prompt_tokens to tensors and pad them for efficient batch processing
-    prompt_tensors = [torch.tensor(p, dtype=torch.long, device="cuda") for p in prompt_tokens]
-    # Pad them to the maximum prompt length in the batch using -1 as padding value
-    # `pad_sequence` handles varying lengths and ensures batch_first output
+    # Convert prompt_tokens to tensors on CUDA, no grad
+    prompt_tensors = [torch.tensor(p, dtype=torch.long, device="cuda", requires_grad=False) for p in prompt_tokens]
+    # Pad them to max prompt length in batch using -1
     padded_prompt_tensor = pad_sequence(prompt_tensors, batch_first=True, padding_value=-1)
 
-    # Initialize the main tokens tensor with the padded prompts
-    # Ensure total_len is at least the padded prompt length
-    tokens = torch.full((batch_size, total_len), -1, dtype=torch.long, device="cuda")
+    tokens = torch.full((batch_size, total_len), -1, dtype=torch.long, device="cuda", requires_grad=False)
     tokens[:, :padded_prompt_tensor.shape[1]] = padded_prompt_tensor
 
     prev_pos = 0
-    finished = torch.zeros(batch_size, dtype=torch.bool, device="cuda", requires_grad=False)
+    finished = torch.zeros(batch_size, dtype=torch.bool, device="cuda")
     prompt_mask = tokens != -1
 
+    # Use model once on prompt to cache key-values if possible, then generate one token at a time
     for cur_pos in range(max(prompt_lens), total_len):
         logits = model.forward(tokens[:, :cur_pos], prev_pos)
         if temperature > 0:
             next_token = sample(logits, temperature)
         else:
             next_token = logits.argmax(dim=-1)
-        # Use torch.where to handle prompt tokens efficiently
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
-        # Check for finished sequences
         finished |= (next_token == eos_id) & (~prompt_mask[:, cur_pos])
         if finished.all():
             break
@@ -128,31 +101,20 @@ def main(
     max_new_tokens: int = 100,
     temperature: float = 1.0,
 ) -> None:
-    """
-    Main function to load the model and perform interactive or batch text generation.
-
-    Args:
-        ckpt_path (str): Path to the model checkpoint directory.
-        config (str): Path to the model configuration file.
-        input_file (str, optional): Path to a file containing input prompts. Defaults to "".
-        interactive (bool, optional): Whether to run in interactive mode. Defaults to True.
-        max_new_tokens (int, optional): Maximum number of new tokens to generate. Defaults to 100.
-        temperature (float, optional): Temperature for sampling. Defaults to 1.0.
-    """
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
     if world_size > 1:
         dist.init_process_group("nccl")
     
-    # Redirect print to be a no-op on non-main processes
+    # Disable printing on non-primary processes
     if rank != 0:
         global print
-        print = lambda *_, **__: None
+        print = lambda *args, **kwargs: None
 
     torch.cuda.set_device(local_rank)
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_num_threads(os.cpu_count())
+    torch.set_num_threads(8)
     torch.manual_seed(965)
     
     with open(config) as f:
@@ -165,13 +127,12 @@ def main(
     
     # Generate initial dummy tokens to initialize model device
     initial_tokens = [tokenizer.encode("DeepSeek")]
-    generated_ids = generate(model, initial_tokens, 2, tokenizer.eos_token_id, 1.)
+    generated_ids = generate(model, initial_tokens, 2, -1, 1.)
     tokenizer.decode(generated_ids[0])
     
     load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
 
     if interactive:
-        # Limit history to the last 10 exchanges (20 messages)
         MAX_HISTORY_SIZE = 20
         messages = []
         
@@ -183,7 +144,7 @@ def main(
                 objects = [None]
                 dist.broadcast_object_list(objects, 0)
                 prompt = objects[0]
-            else: # world_size == 1
+            else:
                 prompt = input(">>> ")
                 
             if prompt == "/exit":
@@ -195,18 +156,16 @@ def main(
             
             messages.append({"role": "user", "content": prompt})
             
-            prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=False)
+            prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
             completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
             completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
             print(completion)
             
             messages.append({"role": "assistant", "content": completion})
 
-            # Trim history to maintain the desired size (removes oldest user/assistant pair)
             while len(messages) > MAX_HISTORY_SIZE:
                 del messages[:2]
     else:
-        # Process prompts from a file in memory-efficient chunks
         BATCH_CHUNK_SIZE = min(8, args.max_batch_size)
         
         try:
@@ -221,7 +180,6 @@ def main(
                         _process_batch_chunk(prompt_batch, tokenizer, model, max_new_tokens, temperature)
                         prompt_batch.clear()
                 
-                # Process any remaining prompts in the last batch
                 if prompt_batch:
                     _process_batch_chunk(prompt_batch, tokenizer, model, max_new_tokens, temperature)
         except FileNotFoundError:

@@ -56,8 +56,12 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
     # Process each file separately to reduce peak memory usage
     safetensor_files = glob(os.path.join(hf_ckpt_path, "*.safetensors"))
     
-    for file_path in tqdm(safetensor_files):
-        state_dicts = [{} for _ in range(mp)]
+    # Batch processing of files
+    batch_size = 5  # Number of files to process in a batch
+    for i in range(0, len(safetensor_files), batch_size):
+        batch_files = safetensor_files[i:i + batch_size]
+        for file_path in tqdm(batch_files):
+            state_dicts = [{} for _ in range(mp)]
         
         with safe_open(file_path, framework="pt", device="cpu") as f:
             for name in f.keys():
@@ -104,14 +108,14 @@ def main(hf_ckpt_path, save_path, n_experts, mp):
                         # Parameter is replicated across all ranks
                         state_dicts[i][name] = param
         
-        # Save state dicts for this file and clear memory
-        for i in range(mp):
-            if state_dicts[i]:  # Only save if there are parameters
-                output_file = os.path.join(save_path, f"model{i}-mp{mp}-{os.path.basename(file_path)}")
-                save_file(state_dicts[i], output_file)
-        
-        # Clear memory after processing each file
-        del state_dicts
+            # Save state dicts for this batch and clear memory
+            for i in range(mp):
+                if state_dicts[i]:  # Only save if there are parameters
+                    output_file = os.path.join(save_path, f"model{i}-mp{mp}-{os.path.basename(file_path)}")
+                    save_file(state_dicts[i], output_file)
+            
+            # Clear memory after processing each batch
+            del state_dicts
 
     # Copy tokenizer files
     for file_path in glob(os.path.join(hf_ckpt_path, "*token*")):
@@ -127,4 +131,10 @@ if __name__ == "__main__":
     parser.add_argument("--model-parallel", type=int, required=True)
     args = parser.parse_args()
     assert args.n_experts % args.model_parallel == 0
+    import time
+
+    start_time = time.time()
     main(args.hf_ckpt_path, args.save_path, args.n_experts, args.model_parallel)
+    end_time = time.time()
+    
+    print(f"Execution time: {end_time - start_time:.2f} seconds")

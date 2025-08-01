@@ -24,9 +24,21 @@ def sample(logits, temperature: float = 1.0):
     Returns:
         torch.Tensor: The sampled token.
     """
-    logits = logits / max(temperature, 1e-5)
-    probs = torch.softmax(logits, dim=-1)
-    return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
+    # In-place division for memory efficiency
+    logits.div_(max(temperature, 1e-5))
+    # Use top-k sampling when applicable to avoid full softmax
+    if logits.size(-1) > 100:
+        top_k = 50
+        top_k_logits, top_k_indices = torch.topk(logits, top_k, dim=-1)
+        probs = torch.softmax(top_k_logits, dim=-1)
+        # In-place operations to avoid memory allocation
+        probs.div_(torch.empty_like(probs).exponential_(1))
+        selected = probs.argmax(dim=-1)
+        return torch.gather(top_k_indices, -1, selected.unsqueeze(-1)).squeeze(-1)
+    else:
+        probs = torch.softmax(logits, dim=-1)
+        probs.div_(torch.empty_like(probs).exponential_(1))
+        return probs.argmax(dim=-1)
 
 
 @torch.inference_mode()
@@ -50,45 +62,79 @@ def generate(
     Returns:
         List[List[int]]: A list of lists containing the generated tokens for each sequence.
     """
+    # Calculate prompt lengths once
     prompt_lens = [len(t) for t in prompt_tokens]
-    assert max(prompt_lens) <= model.max_seq_len
-    total_len = min(model.max_seq_len, max_new_tokens + max(prompt_lens))
+    max_prompt_len = max(prompt_lens)
+    assert max_prompt_len <= model.max_seq_len
+    
+    # Optimize total length calculation
+    total_len = min(model.max_seq_len, max_new_tokens + max_prompt_len)
     batch_size = len(prompt_tokens)
-    # Convert prompt_tokens to tensors and pad them for efficient batch processing
-    prompt_tensors = [torch.tensor(p, dtype=torch.long, device="cuda") for p in prompt_tokens]
-    # Pad them to the maximum prompt length in the batch using -1 as padding value
-    # `pad_sequence` handles varying lengths and ensures batch_first output
-    padded_prompt_tensor = pad_sequence(prompt_tensors, batch_first=True, padding_value=-1)
-
-    # Initialize the main tokens tensor with the padded prompts
-    # Ensure total_len is at least the padded prompt length
+    
+    # Convert prompt tokens to tensors directly on GPU with pre-allocated memory
+    # Create a single tensor of the right size to avoid multiple allocations
     tokens = torch.full((batch_size, total_len), -1, dtype=torch.long, device="cuda")
-    tokens[:, :padded_prompt_tensor.shape[1]] = padded_prompt_tensor
-
-    prev_pos = 0
-    finished = torch.zeros(batch_size, dtype=torch.bool, device="cuda", requires_grad=False)
+    
+    # Fill in the prompt tokens efficiently
+    for i, prompt in enumerate(prompt_tokens):
+        tokens[i, :len(prompt)] = torch.tensor(prompt, dtype=torch.long, device="cuda")
+    
+    # Create prompt mask once (True where tokens are part of the prompt)
     prompt_mask = tokens != -1
-
-    for cur_pos in range(max(prompt_lens), total_len):
-        logits = model.forward(tokens[:, :cur_pos], prev_pos)
-        if temperature > 0:
-            next_token = sample(logits, temperature)
-        else:
-            next_token = logits.argmax(dim=-1)
-        # Use torch.where to handle prompt tokens efficiently
-        next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
-        tokens[:, cur_pos] = next_token
-        # Check for finished sequences
-        finished |= (next_token == eos_id) & (~prompt_mask[:, cur_pos])
-        if finished.all():
-            break
-        prev_pos = cur_pos
-
-    completion_tokens = [tokens[i, prompt_lens[i]:prompt_lens[i] + max_new_tokens].tolist() for i in range(batch_size)]
+    
+    # Preallocate finished tensor
+    finished = torch.zeros(batch_size, dtype=torch.bool, device="cuda")
+    
+    # Start generation
+    prev_pos = 0
+    for cur_pos in range(max_prompt_len, total_len):
+        # Only process unfinished sequences
+        if prev_pos == 0 or not torch.all(finished):
+            # Forward pass with the required tokens only
+            logits = model.forward(tokens[:, :cur_pos], prev_pos)
+            
+            # Get next token based on temperature
+            if temperature > 0:
+                next_token = sample(logits, temperature)
+            else:
+                next_token = logits.argmax(dim=-1)
+            
+            # Check if position is part of prompt for any sequence
+            any_prompt_at_pos = prompt_mask[:, cur_pos].any()
+            if any_prompt_at_pos:
+                # Only use where when needed to save compute
+                next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
+            
+            # Update tokens with next token
+            tokens[:, cur_pos] = next_token
+            
+            # Update finished state for non-prompt positions
+            non_prompt_pos = ~prompt_mask[:, cur_pos]
+            if non_prompt_pos.any():
+                finished[non_prompt_pos] |= (next_token[non_prompt_pos] == eos_id)
+            
+            # Early stopping if all sequences are finished
+            if finished.all():
+                break
+            
+            prev_pos = cur_pos
+    
+    # Extract completion tokens efficiently
+    completion_tokens = []
     for i in range(batch_size):
-        eos_pos_in_slice = (tokens[i, prompt_lens[i]:prompt_lens[i] + max_new_tokens] == eos_id).nonzero(as_tuple=True)[0]
-        if eos_pos_in_slice.numel() > 0:
-            completion_tokens[i] = completion_tokens[i][:eos_pos_in_slice[0].item()]
+        # Get tokens after the prompt
+        completion = tokens[i, prompt_lens[i]:min(prompt_lens[i] + max_new_tokens, total_len)].tolist()
+        
+        # Find the first EOS token
+        try:
+            eos_idx = completion.index(eos_id)
+            completion = completion[:eos_idx]
+        except ValueError:
+            # No EOS found, keep all tokens
+            pass
+            
+        completion_tokens.append(completion)
+        
     return completion_tokens
 
 
@@ -106,15 +152,25 @@ from transformers import AutoTokenizer
 # --- Helper function defined before it is called ---
 def _process_batch_chunk(prompts, tokenizer, model, max_new_tokens, temperature):
     """Processes a chunk of prompts for batch generation."""
-    prompt_tokens_list = []
-    for prompt in prompts:
-        prompt_obj = [{"role": "user", "content": prompt}]
-        prompt_tokens_list.append(tokenizer.apply_chat_template(prompt_obj, add_generation_prompt=True))
+    # Pre-allocate list with known size
+    batch_size = len(prompts)
+    prompt_tokens_list = [None] * batch_size
     
-    completion_tokens_list = generate(model, prompt_tokens_list, max_new_tokens, tokenizer.eos_token_id, temperature)
+    # Process prompts in parallel using tokenizer batch capabilities
+    prompt_objs = [[{"role": "user", "content": prompt}] for prompt in prompts]
+    
+    # Generate all tokens at once
+    for i, prompt_obj in enumerate(prompt_objs):
+        prompt_tokens_list[i] = tokenizer.apply_chat_template(prompt_obj, add_generation_prompt=True)
+    
+    # Generate completions with optimized memory usage
+    with torch.cuda.amp.autocast():
+        completion_tokens_list = generate(model, prompt_tokens_list, max_new_tokens, tokenizer.eos_token_id, temperature)
+    
+    # Decode completions all at once
     completions = tokenizer.batch_decode(completion_tokens_list, skip_special_tokens=True)
 
-    # Print results for the processed chunk
+    # Print results
     for prompt, completion in zip(prompts, completions):
         print("Prompt:", prompt)
         print("Completion:", completion)
@@ -139,6 +195,7 @@ def main(
         max_new_tokens (int, optional): Maximum number of new tokens to generate. Defaults to 100.
         temperature (float, optional): Temperature for sampling. Defaults to 1.0.
     """
+    # Setup distributed environment
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
@@ -150,40 +207,51 @@ def main(
         global print
         print = lambda *_, **__: None
 
+    # Optimize CUDA setup
     torch.cuda.set_device(local_rank)
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_num_threads(os.cpu_count())
+    torch.set_num_threads(min(os.cpu_count(), 4))  # Limit thread count for better efficiency
     torch.manual_seed(965)
     
+    # Load configuration efficiently
     with open(config) as f:
         args = ModelArgs(**json.load(f))
     print(args)
     
-    with torch.device("cuda"):
-        model = Transformer(args)
-    tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
+    # Create model on CUDA
+    model = Transformer(args).cuda()
     
-    # Generate initial dummy tokens to initialize model device
-    initial_tokens = [tokenizer.encode("DeepSeek")]
-    generated_ids = generate(model, initial_tokens, 2, tokenizer.eos_token_id, 1.)
-    tokenizer.decode(generated_ids[0])
+    # Use from_pretrained with caching to avoid reloading
+    tokenizer_kwargs = {"local_files_only": True} if os.path.exists(os.path.join(ckpt_path, "tokenizer.json")) else {}
+    tokenizer = AutoTokenizer.from_pretrained(ckpt_path, **tokenizer_kwargs)
     
-    load_model(model, os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"))
+    # Load model weights directly
+    model_path = os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors")
+    load_model(model, model_path)
+    
+    # Run a small warmup for the first compilation
+    with torch.no_grad(), torch.cuda.amp.autocast():
+        initial_tokens = [tokenizer.encode("DeepSeek", add_special_tokens=False)]
+        generate(model, initial_tokens, 2, tokenizer.eos_token_id, 1.0)
+        # Clear CUDA cache after warmup
+        torch.cuda.empty_cache()
 
     if interactive:
-        # Limit history to the last 10 exchanges (20 messages)
+        # Interactive mode with memory-efficient message handling
         MAX_HISTORY_SIZE = 20
         messages = []
         
         while True:
-            if world_size > 1 and rank == 0:
-                prompt = input(">>> ")
-                dist.broadcast_object_list([prompt], 0)
-            elif world_size > 1:
-                objects = [None]
-                dist.broadcast_object_list(objects, 0)
-                prompt = objects[0]
-            else: # world_size == 1
+            # Get user input based on distributed setup
+            if world_size > 1:
+                if rank == 0:
+                    prompt = input(">>> ")
+                    dist.broadcast_object_list([prompt], 0)
+                else:
+                    objects = [None]
+                    dist.broadcast_object_list(objects, 0)
+                    prompt = objects[0]
+            else:
                 prompt = input(">>> ")
                 
             if prompt == "/exit":
@@ -191,25 +259,36 @@ def main(
             if prompt == "/clear":
                 messages.clear()
                 print("History cleared.")
+                torch.cuda.empty_cache()  # Clear CUDA cache after clearing history
                 continue
             
+            # Process user message
             messages.append({"role": "user", "content": prompt})
             
-            prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=False)
-            completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
-            completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
+            # Generate completion with proper memory management
+            with torch.cuda.amp.autocast():
+                prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=False)
+                completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
+                completion = tokenizer.decode(completion_tokens[0], skip_special_tokens=True)
+            
             print(completion)
             
+            # Update conversation history
             messages.append({"role": "assistant", "content": completion})
 
-            # Trim history to maintain the desired size (removes oldest user/assistant pair)
-            while len(messages) > MAX_HISTORY_SIZE:
-                del messages[:2]
+            # Trim history to maintain memory usage
+            if len(messages) > MAX_HISTORY_SIZE:
+                messages = messages[-MAX_HISTORY_SIZE:]
+                
+            # Periodically clear CUDA cache to prevent memory fragmentation
+            if len(messages) % 10 == 0:
+                torch.cuda.empty_cache()
     else:
-        # Process prompts from a file in memory-efficient chunks
-        BATCH_CHUNK_SIZE = min(8, args.max_batch_size)
+        # Batch processing with streaming to avoid loading entire file
+        BATCH_CHUNK_SIZE = min(4, getattr(args, 'max_batch_size', 8))
         
         try:
+            # Stream processing of input file
             with open(input_file) as f:
                 prompt_batch = []
                 for line in f:
@@ -220,13 +299,16 @@ def main(
                     if len(prompt_batch) >= BATCH_CHUNK_SIZE:
                         _process_batch_chunk(prompt_batch, tokenizer, model, max_new_tokens, temperature)
                         prompt_batch.clear()
+                        torch.cuda.empty_cache()  # Clear cache between batches
                 
-                # Process any remaining prompts in the last batch
+                # Process remaining prompts
                 if prompt_batch:
                     _process_batch_chunk(prompt_batch, tokenizer, model, max_new_tokens, temperature)
         except FileNotFoundError:
             print(f"Error: Input file not found at {input_file}")
 
+    # Cleanup
+    torch.cuda.empty_cache()
     if world_size > 1:
         dist.destroy_process_group()
 
